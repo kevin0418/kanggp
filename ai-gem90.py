@@ -24,10 +24,8 @@ def reset_patient_session():
     """다음 환자를 위해 모든 입력 및 생성 데이터를 초기화합니다."""
     st.session_state.ai_draft = ""
     st.session_state.final_content = ""
-    st.session_state.pmh_input = ""
-    st.session_state.current_input = ""
-    st.session_state.edited_input = ""
-    # file_uploader의 key 값을 변경하여 업로드된 파일 목록 강제 초기화
+    st.session_state.step = 1
+    # file_uploader 초기화
     st.session_state.uploader_key = st.session_state.get("uploader_key", 0) + 1
     st.rerun()
 
@@ -36,33 +34,37 @@ if "ai_draft" not in st.session_state:
     st.session_state.ai_draft = ""
 if "final_content" not in st.session_state:
     st.session_state.final_content = ""
+if "step" not in st.session_state:
+    st.session_state.step = 1
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
-if "pmh_input" not in st.session_state:
-    st.session_state.pmh_input = "62세 남성. 기저질환: 고혈압, 제2형 당뇨."
-if "current_input" not in st.session_state:
-    st.session_state.current_input = "최근 2주간 극심한 피로감과 발목 부종 발생."
 
 # -------------------------------------------------------------
-# 1. PDF 생성 함수 (한글/영문 폰트 자동 등록 및 스타일 적용)
+# 1. 안전한 PDF 생성 함수 (지연/멈춤 100% 방지)
 # -------------------------------------------------------------
 def get_korean_font_name():
     font_name = "NanumGothic"
-    if font_name not in pdfmetrics.getRegisteredFontNames():
-        font_path = "NanumGothic.ttf"
-        if not os.path.exists(font_path):
-            try:
-                url = "https://raw.githubusercontent.com/google/fonts/main/ofl/nanumgothic/NanumGothic-Regular.ttf"
-                urllib.request.urlretrieve(url, font_path)
-            except Exception:
-                pass
-        
-        if os.path.exists(font_path):
+    if font_name in pdfmetrics.getRegisteredFontNames():
+        return font_name
+
+    font_path = "NanumGothic.ttf"
+    # 1. 프로젝트 폴더에 파일이 있으면 즉시 등록 (0.01초)
+    if os.path.exists(font_path):
+        try:
             pdfmetrics.registerFont(TTFont(font_name, font_path))
             return font_name
-        else:
+        except Exception:
             return "Helvetica"
-    return font_name
+
+    # 2. 파일이 없으면 웹 다운로드 시도 (최대 1.5초만 대기 후 실패 시 기본 영문폰트)
+    try:
+        url = "https://raw.githubusercontent.com/google/fonts/main/ofl/nanumgothic/NanumGothic-Regular.ttf"
+        with urllib.request.urlopen(url, timeout=1.5) as response, open(font_path, 'wb') as out_file:
+            out_file.write(response.read())
+        pdfmetrics.registerFont(TTFont(font_name, font_path))
+        return font_name
+    except Exception:
+        return "Helvetica"
 
 def generate_pdf(content_text):
     buffer = io.BytesIO()
@@ -161,25 +163,43 @@ def extract_text_from_file(uploaded_file):
     return text
 
 # -------------------------------------------------------------
-# 3. Streamlit UI 및 Gemini API 설정
+# 3. Streamlit UI 및 Gemini API 설정 (안전성 강화)
 # -------------------------------------------------------------
 st.set_page_config(page_title="AI 어시스턴트 to GP", layout="wide")
 
-if "GEMINI_API_KEY" in st.secrets:
-    api_key = st.secrets["GEMINI_API_KEY"]
-else:
-    api_key = os.getenv("GEMINI_API_KEY")
-    
-client = genai.Client(api_key=api_key)
+# # API 키 명확한 검증
+# api_key = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
 
-# 사이드바 컨트롤 영역 (상시 리셋 버튼 배치)
+# API 키 명확한 우선순위 지정
+selected_api_key = (
+    st.secrets.get("GEMINI_API_KEY") 
+    or os.getenv("GEMINI_API_KEY") 
+    or os.getenv("GOOGLE_API_KEY")
+)
+
+api_key = selected_api_key
+
+client = genai.Client(api_key=selected_api_key)
+
 with st.sidebar:
     st.header("⚙️ 관리 도구")
+    if not api_key:
+        api_key = st.text_input("🔑 Gemini API Key 입력", type="password")
+        if not api_key:
+            st.warning("API Key가 설정되어 있지 않습니다.")
+    
+    st.write("---")
     st.write("새 환자가 오면 버튼을 눌러 모든 데이터를 초기화하세요.")
     if st.button("🔄 새 환자 진료 (Clear All)", use_container_width=True, type="secondary"):
         reset_patient_session()
 
 st.title("🩺 AI 분석 및 환자 설명 시스템")
+
+if not api_key:
+    st.error("⚠️ GEMINI_API_KEY가 감지되지 않았습니다. 사이드바에 API 키를 입력하거나 .env / st.secrets를 설정해주세요.")
+    st.stop()
+
+client = genai.Client(api_key=api_key)
 
 # -------------------------------------------------------------
 # 4. 데이터 입력 섹션 (과거 기록 + 현재 상황 + 파일 업로드)
@@ -190,12 +210,12 @@ with st.expander("📂 1단계: 환자 데이터 및 검사 결과 입력", expa
         pmh_data = st.text_area(
             "과거 병력 및 기본 데이터 (PMHx)", 
             height=150, 
-            key="pmh_input"
+            value="62세 남성. 기저질환: 고혈압, 제2형 당뇨."
         )
         current_data = st.text_area(
             "현재 호소 증상 및 상황 (Current Issue)", 
             height=150, 
-            key="current_input"
+            value="최근 2주간 극심한 피로감과 발목 부종 발생."
         )
     with col2:
         st.markdown("**검사 결과 파일 업로드 (PDF, Word, TXT)**")
@@ -213,24 +233,23 @@ with st.expander("📂 1단계: 환자 데이터 및 검사 결과 입력", expa
                 file_text_combined += extract_text_from_file(f) + "\n"
             st.success(f"{len(uploaded_files)}개의 파일이 로드되었습니다.")
 
+            
+            
 # -------------------------------------------------------------
-# 5. AI 분석 실행 (권장 방식: Chat 세션 생성 후 send_message 사용)
+# 5. AI 분석 실행 (멈춤 현상 해결 버전)
 # -------------------------------------------------------------
 if st.button("🚀 AI 분석 및 초안 생성", type="primary"):
-    with st.spinner("데이터를 종합하여 분석 중입니다..."):
-        
-        # 시스템 프롬프트 정의
+    with st.spinner("Gemini가 데이터를 분석하고 초안을 작성 중입니다..."):
         system_instruction = (
             "너는 호주 GP(General Practitioner)를 보조하는 임상 AI 어시스턴트야. "
             "주어진 환자 정보와 검사 결과를 바탕으로, 의사가 환자에게 직접 화면을 보여주며 "
             "이해하기 쉽게 설명할 수 있는 '환자용 요약 및 케어 가이드라인' 초안을 마크다운으로 작성해 줘."
         )
-
         user_prompt = f"""
 [환자 데이터]
 - 과거력 (PMHx): {pmh_data}
 - 현재 호소 증상: {current_data}
-- 검사 결과 파일 내용: {file_text_combined}
+- 검사 결과 파일 내용: {file_text_combined[:8000]}  # 텍스트가 너무 긴 경우 대비 슬라이싱
 
 [작성 및 출력 양식]
 반드시 마크다운을 사용해 아래 3가지 섹션으로 작성해 줘:
@@ -239,8 +258,7 @@ if st.button("🚀 AI 분석 및 초안 생성", type="primary"):
 3. 💡 향후 치료 및 주의사항 (Action Plan)
 """
         try:
-            # 1. Chat 세션 생성 (권장: 시스템 인스트럭션 및 설정 부여)
-            # 향후 tools=[...] 추가 시에도 자동 함수 호출(AFC)이 완벽하게 지원됩니다.
+            # chat 세션 생성
             chat = client.chats.create(
                 model='gemini-2.5-flash',
                 config=types.GenerateContentConfig(
@@ -248,39 +266,51 @@ if st.button("🚀 AI 분석 및 초안 생성", type="primary"):
                     temperature=0.2
                 )
             )
-
-            # 2. send_message로 호출 (권장 패턴)
+            
+            # 메시지 전송
             response = chat.send_message(user_prompt)
-            st.session_state.ai_draft = response.text
-
+            
+            # 응답 정상 수신 확인
+            if response and response.text:
+                st.session_state.ai_draft = response.text
+                st.session_state.final_content = response.text
+                st.session_state.step = 2
+                st.success("초안 생성이 완료되었습니다! 아래 2단계에서 확인하세요.")
+            else:
+                st.warning("Gemini에서 빈 응답이 반환되었습니다.")
+                
         except Exception as e:
-            st.error(f"AI API 오류: {e}")
+            st.error(f"❌ AI 분석 중 오류가 발생했습니다: {str(e)}")
+            print(f"[ERROR DEBUG] AI Call Failed: {e}")  # 터미널에도 에러 출력
 
 # -------------------------------------------------------------
-# 6. 의사 검토 및 수정 (Human-in-the-loop)
+# 6. 의사 검토 및 수정
 # -------------------------------------------------------------
-if st.session_state.ai_draft:
+if st.session_state.step >= 2 and st.session_state.ai_draft:
     st.markdown("---")
     st.subheader("✍️ 2단계: GP 검토 및 초안 수정")
     st.info("AI가 작성한 아래 내용을 원장님의 의학적 판단에 맞게 자유롭게 수정하세요.")
     
     edited_text = st.text_area(
         "최종 설명서 초안", 
-        value=st.session_state.ai_draft, 
-        height=320,
-        key="edited_input"
+        value=st.session_state.final_content, 
+        height=320
     )
     
-    if st.button("✅ 수정 완료 및 환자 설명 화면 띄우기"):
-        st.session_state.final_content = edited_text
+    col_btn1, col_btn2 = st.columns([1, 4])
+    with col_btn1:
+        if st.button("✅ 수정 완료 및 3단계 확정"):
+            st.session_state.final_content = edited_text
+            st.session_state.step = 3
+            st.rerun()
 
 # -------------------------------------------------------------
 # 7. 환자용 화면 & 저장 & 완료 후 Clear 버튼
 # -------------------------------------------------------------
-if st.session_state.final_content:
+if st.session_state.step == 3 and st.session_state.final_content:
     st.markdown("---")
     st.subheader("🖥️ 3단계: 환자 설명용 인포그래픽 화면")
-    st.caption("이 화면을 환자에게 보여주며 설명하시거나, 파일로 저장할 수 있습니다.")
+    st.caption("이 화면을 환자에게 보여주며 설명하시거나, 필요에 따라 TXT 또는 정식 PDF로 저장할 수 있습니다.")
     
     st.markdown("""
     <style>
@@ -318,8 +348,6 @@ if st.session_state.final_content:
             use_container_width=True
         )
 
-    # 리포트 완료 후 다음 환자를 위한 하단 초기화 버튼
     st.markdown("---")
-    st.write("진료 및 리포트 전달이 끝났다면 아래 버튼을 눌러 다음 환자를 준비하세요.")
     if st.button("✨ 진료 완료 및 다음 환자 맞이하기 (Clear All)", type="secondary", use_container_width=True):
         reset_patient_session()
